@@ -150,39 +150,39 @@ for pkg in ['newrelic-php5','newrelic-php5-common','newrelic-daemon','newrelic-s
 
 show('4. PHP VERSION-WISE CONFIG AND FPM STATUS')
 versions=sorted((p.name for p in PHP_ROOT.glob('*') if p.is_dir() and re.fullmatch(r'\d+\.\d+',p.name)),key=lambda x:tuple(map(int,x.split('.'))))
+counts=Counter(a['php'] for a in apps)
+used=sorted(counts,key=lambda x:tuple(map(int,x.split('.'))))
 state={}
-for v in versions:
+if not used:
+    print('[STOP] Application PHP versions could not be determined. No version-specific changes recommended.')
+for v in used:
     base=PHP_ROOT/v
     ini=base/'mods-available'/'newrelic.ini'
     conf=base/'fpm'/'conf.d'
-    links=sorted(conf.glob('*newrelic*.ini')) if conf.is_dir() else []
-    links=[p for p in links if p.exists()]
+    links=[p for p in sorted(conf.glob('*newrelic*.ini')) if p.exists()] if conf.is_dir() else []
     query=command(['phpquery','-v',v,'-s','fpm','-m','newrelic'])
     enabled=bool(query and query.returncode == 0)
     svc=command(['systemctl','is-active',f'php{v}-fpm'])
-    state[v]={'ini':ini,'enabled':enabled,'links':links,'service':svc.stdout.strip() if svc and svc.stdout.strip() else 'unknown'}
+    svc_state=svc.stdout.strip() if svc and svc.stdout.strip() else 'unknown'
+    state[v]={'ini':ini,'enabled':enabled,'links':links,'service':svc_state}
     print(f'\n--- PHP {v} ---')
-    status('Applications (appcount)',str(Counter(a['php'] for a in apps).get(v,0)) if apps else 'unknown')
+    status('Applications (appcount)',counts[v])
     status('INI path',str(ini))
     status('INI exists',str(ini.is_file()))
-    status('License',license_state(ini))
-    if apps and Counter(a['php'] for a in apps).get(v, 0) > 0:
-        line_no, secret = license_details(ini)
-        status('License location', f'{ini}:{line_no}' if line_no else f'{ini} (directive missing)')
-        print(f'{RED}SECURITY: Full license key below is a SECRET; do not paste this output into tickets or chats.{RESET}')
-        status('License key (FULL)', secret if secret else '(EMPTY / NOT FOUND)')
-    if enabled:
-        status('FPM extension', 'ENABLED')
+    line_no, secret=license_details(ini)
+    valid=bool(secret and secret not in ('YOUR_LICENSE_KEY','REPLACE_WITH_REAL_KEY'))
+    status('License', 'POPULATED' if valid else f'{RED}MISSING / EMPTY / PLACEHOLDER{RESET}')
+    status('License location',f'{ini}:{line_no}' if line_no else f'{ini} (directive missing)')
+    if valid:
+        status('License key (FULL)',secret)
+        print('SECURITY: Keep this license key private; do not share complete output.')
     else:
-        status('FPM extension', f'{RED}NOT ENABLED / NOT CONFIRMED{RESET}')
-        if state[v]['service'] == 'active':
-            print(f'{RED}[ACTION REQUIRED] After enabling the extension, validate and restart php{v}-fpm to load it (approval required).{RESET}')
-        else:
-            print(f'{RED}[ACTION REQUIRED] If this PHP version is needed, enable its extension; restart/start the relevant FPM service only when approved.{RESET}')
+        print(f'{RED}[ACTION REQUIRED] Add the New Relic license key from Cloudways UI to {ini} to activate PHP APM.{RESET}')
+    status('FPM extension','ENABLED' if enabled else f'{RED}NOT ENABLED{RESET}')
     for link in links:
         status('FPM config path',str(link))
         status('Symlink target',str(link.resolve()))
-    status('FPM service',state[v]['service'])
+    status('FPM service',svc_state)
 
 show('5. DAEMON / LOGS')
 proc=command(['pgrep','-af','[/]usr/bin/newrelic-daemon'])
@@ -213,88 +213,51 @@ elif not installed('newrelic-php5'):
 else:
     print('[OK] PHP agent package already installed; do not reinstall unnecessarily.')
 
-show('6A. PRE-REQUISITE ASSESSMENT FOR IN-USE PHP VERSIONS')
-if not apps:
-    print('[STOP] App-to-PHP mapping unavailable. Run appcount/verify active PHP versions before enabling anything.')
-else:
-    used=sorted(set(a['php'] for a in apps), key=lambda x: tuple(map(int,x.split('.'))))
-    for v in used:
-        d=state.get(v)
-        print(f'\n--- PHP {v} | apps: {sum(a["php"]==v for a in apps)} ---')
-        problems=[]
-        if not installed('newrelic-php5') or not installed('newrelic-daemon'):
-            problems.append('New Relic PHP/daemon package missing')
-        if not d or not d['ini'].is_file():
-            problems.append('New Relic INI missing')
-        elif license_state(d['ini']) != 'POPULATED (not validated)':
-            problems.append('New Relic license missing/empty/placeholder')
-        if not d or d['service'] != 'active':
-            problems.append('PHP-FPM service not active')
-        if problems:
-            print(f'{RED}[NOT READY] ' + '; '.join(problems) + RESET)
-        else:
-            print('[PRE-REQS PRESENT] Agent package, daemon package, INI, populated license and PHP-FPM detected.')
-            print('[VERIFY FIRST] Confirm the license matches the key saved through Cloudways UI; validate pool scope/authorization.')
-            if d['enabled']:
-                print('[ALREADY ENABLED] PHP-FPM module is enabled; verify live reporting.')
-            else:
-                print(f'{RED}[CAN ENABLE AFTER APPROVAL] php{v}-fpm New Relic extension is disabled.' + RESET)
-                print(f'Command: phpenmod -v {v} -s fpm newrelic')
-                print(f'Then: php-fpm{v} -t && systemctl restart php{v}-fpm  # approved maintenance only')
-
 show('7. VERSION-WISE MANUAL SETUP AND POST-CHECKS')
-print('No per-application or pool configuration changes are suggested here.')
-print('CAUTION: enabling New Relic for a PHP version affects every FPM pool using that version.')
-print('Check existing monitoring scope and get approval before any changes.')
-for v in versions:
+print('Read-only advice. Do not change other application pools without authorization.')
+print('Enabling the extension affects all FPM pools using that PHP version.')
+if not used:
+    print('[STOP] No reliable application/PHP mapping; verify appcount before configuring APM.')
+for v in used:
     data=state[v]
     ini=data['ini']
-    count=Counter(a['php'] for a in apps).get(v,0) if apps else None
-    if count == 0 and apps:
+    print(f'\n--- PHP {v} | applications: {counts[v]} ---')
+    print('Pre-requisites checked: PHP agent package, daemon package, New Relic INI, license, PHP-FPM service.')
+    checks={
+        'PHP agent package':bool(installed('newrelic-php5')),
+        'Daemon package':bool(installed('newrelic-daemon')),
+        'INI file':ini.is_file(),
+        'License key':license_state(ini)=='POPULATED (not validated)',
+        'PHP-FPM service':data['service']=='active',
+    }
+    for name,ok in checks.items():
+        status(('✓ ' if ok else '✗ ')+name,'OK' if ok else f'{RED}MISSING / NOT ACTIVE{RESET}')
+    if not checks['License key']:
+        print(f'{RED}[ADD LICENSE VIA UI] Add the New Relic license key from Cloudways UI for PHP {v}; check {ini}.{RESET}')
+    if not all(checks.values()):
+        print(f'{RED}[NOT READY] Complete missing pre-requisites before enabling the PHP agent.{RESET}')
         continue
-    print(f'\n--- PHP {v} | applications: {count if count is not None else "unknown"} ---')
-    suggestion('Show license path, line number and full value MANUALLY (SECRET: do not share output)',
-       f"grep -HnE '^[[:space:]]*newrelic\\.license[[:space:]]*=' {ini}")
-    suggestion('Check whether extension is enabled (read-only)',
-       f"phpquery -v {v} -s fpm -m newrelic\nls -l /etc/php/{v}/fpm/conf.d/*newrelic* 2>/dev/null")
-    if not ini.is_file():
-        print('[STOP] New Relic INI missing for this PHP version. Verify package/config setup first.')
-        continue
-    if license_state(ini) != 'POPULATED (not validated)':
-        print('[STOP] License is missing or placeholder. Edit the existing INI with a valid key first.')
-        suggestion('Open license config for manual editing (avoid displaying keys in chat)', f'vim {ini}')
-    else:
-        print('[OK] License directive populated; verify it matches the intended New Relic account.')
+    print('[PRE-REQUISITES FULFILLED] You can enable the PHP agent after checking impact and obtaining approval.')
+    suggestion('Check extension state',f'phpquery -v {v} -s fpm -m newrelic')
     if not data['enabled']:
-        print(f'{RED}[WARNING] New Relic FPM extension is NOT ENABLED for PHP {v}.{RESET}')
-        suggestion('Enable New Relic extension ONLY after checking scope and license',
-            f'phpenmod -v {v} -s fpm newrelic')
-        print(f'{RED}[IMPORTANT] Enabling the module does NOT load it into existing FPM workers. Validate then restart php{v}-fpm with approval.{RESET}')
+        print(f'{RED}[EXTENSION DISABLED] Enable PHP {v} FPM New Relic extension:{RESET}')
+        print(f'phpenmod -v {v} -s fpm newrelic')
     else:
-        print('[OK] Extension is already enabled; do not enable again.')
-    suggestion('Post-check: confirm module, validate PHP-FPM, and restart ONLY if approved',
-        f"phpquery -v {v} -s fpm -m newrelic\n"
-        f"ls -l /etc/php/{v}/fpm/conf.d/*newrelic*\n"
-        f"php-fpm{v} -t\n"
-        f"# Only if you enabled/changed config and have approval:\n"
-        f"systemctl restart php{v}-fpm\n"
-        f"systemctl is-active php{v}-fpm\n"
-        f"pgrep -af '[n]ewrelic-daemon'\n"
-        f"tail -n 20 /var/log/newrelic/newrelic-daemon.log\n"
-        f"tail -n 20 /var/log/newrelic/php_agent.log")
-show('8. WHEN TO USE WHICH ADVISOR / PHP APM CHECKLIST')
-print('INFRASTRUCTURE MONITORING: server CPU, RAM, disk, network and processes:')
-print('  curl -fsSL https://raw.githubusercontent.com/Muihammadusman2478/newrelic/refs/heads/main/infraagent | bash')
-print('PHP APM MONITORING: PHP transactions, slow requests, SQL and errors:')
-print('  curl -fsSL https://raw.githubusercontent.com/Muihammadusman2478/newrelic/refs/heads/main/phpapm | python3')
-print('PHP APM checklist for each PHP version actually used by applications:')
-print('  1. Verify the Cloudways UI key is in /etc/php/VERSION/mods-available/newrelic.ini for that version.')
-print('  2. Confirm license belongs to intended New Relic account; populated != validated.')
-print('  3. Check other pools using that version and get authorization for the change/restart.')
-print('  4. Enable FPM module, test php-fpmVERSION -t, then restart PHP-FPM with approval.')
-print('  5. Visit the intended site URL and generate normal UNCACHED PHP traffic.')
-print('  6. Check /var/log/newrelic/newrelic-daemon.log and php_agent.log for connection/errors.')
-print('  7. Check that application transactions appear on the APM dashboard.')
-print('WARNING: Full license keys for IN-USE PHP versions are shown; never share complete output publicly.')
-print('WARNING: Only execute remote scripts from trusted/reviewed GitHub sources.')
-print('No New Relic configuration changes were executed by this advisor.')
+        print('[EXTENSION ENABLED] No need to enable it again.')
+    print('\n# Validate PHP-FPM configuration')
+    print(f'php-fpm{v} -t')
+    print('\n# Restart only after enabling/changing configuration, and after approval')
+    print(f'systemctl restart php{v}-fpm')
+    print('\n# Post-check')
+    print(f'phpquery -v {v} -s fpm -m newrelic')
+    print(f'systemctl is-active php{v}-fpm')
+    print("pgrep -af '[n]ewrelic-daemon'")
+    print('\n# Visit the application URL(s), perform normal uncached PHP activity, then check logs')
+    for a in apps:
+        if a['php']==v and a['state']=='enable':
+            print(f'Application URL: {a["url"]}')
+    print('tail -n 20 /var/log/newrelic/newrelic-daemon.log')
+    print('tail -n 20 /var/log/newrelic/php_agent.log')
+    print('Confirm the app connected in daemon logs and transactions appear in the APM dashboard.')
+
+print('\nNo New Relic configuration changes were executed by this advisor.')
