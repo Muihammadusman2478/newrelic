@@ -203,7 +203,7 @@ for v in versions:
         print('[STOP] New Relic INI missing for this PHP version. Verify package/config setup first.')
         continue
     if license_state(ini) != 'POPULATED (not validated)':
-        print('[STOP] License is missing or placeholder. Edit the existing INI with a valid key first.')
+        print('[STOP] License is missing or placeholder. Edit the existing INI with a valid key first, BETTER add from the UI under monitoring section.')
         suggestion('Open license config for manual editing (avoid displaying keys in chat)', f'vim {ini}')
     else:
         print('[OK] License directive populated; verify it matches the intended New Relic account.')
