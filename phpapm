@@ -78,6 +78,20 @@ def parse_apps(output):
             apps.append({'id':cols[0], 'url':cols[1], 'state':cols[3], 'stack':cols[4], 'php':version})
     return apps
 
+def license_details(path):
+    """Read active license directive and source line; never write a key to a file."""
+    if not path.is_file():
+        return None, None
+    try:
+        for line_no, line in reversed(list(enumerate(path.read_text(errors='replace').splitlines(), 1))):
+            m = re.match(r'^\s*newrelic\.license\s*=\s*(.*?)\s*$', line)
+            if m:
+                value = m.group(1).split(';', 1)[0].strip().strip('"\'')
+                return line_no, value
+    except OSError:
+        pass
+    return None, None
+
 def license_state(path):
     if not path.is_file():
         return 'FILE MISSING'
@@ -152,6 +166,11 @@ for v in versions:
     status('INI path',str(ini))
     status('INI exists',str(ini.is_file()))
     status('License',license_state(ini))
+    if apps and Counter(a['php'] for a in apps).get(v, 0) > 0:
+        line_no, secret = license_details(ini)
+        status('License location', f'{ini}:{line_no}' if line_no else f'{ini} (directive missing)')
+        print(f'{RED}SECURITY: Full license key below is a SECRET; do not paste this output into tickets or chats.{RESET}')
+        status('License key (FULL)', secret if secret else '(EMPTY / NOT FOUND)')
     if enabled:
         status('FPM extension', 'ENABLED')
     else:
@@ -194,6 +213,35 @@ elif not installed('newrelic-php5'):
 else:
     print('[OK] PHP agent package already installed; do not reinstall unnecessarily.')
 
+show('6A. PRE-REQUISITE ASSESSMENT FOR IN-USE PHP VERSIONS')
+if not apps:
+    print('[STOP] App-to-PHP mapping unavailable. Run appcount/verify active PHP versions before enabling anything.')
+else:
+    used=sorted(set(a['php'] for a in apps), key=lambda x: tuple(map(int,x.split('.'))))
+    for v in used:
+        d=state.get(v)
+        print(f'\n--- PHP {v} | apps: {sum(a["php"]==v for a in apps)} ---')
+        problems=[]
+        if not installed('newrelic-php5') or not installed('newrelic-daemon'):
+            problems.append('New Relic PHP/daemon package missing')
+        if not d or not d['ini'].is_file():
+            problems.append('New Relic INI missing')
+        elif license_state(d['ini']) != 'POPULATED (not validated)':
+            problems.append('New Relic license missing/empty/placeholder')
+        if not d or d['service'] != 'active':
+            problems.append('PHP-FPM service not active')
+        if problems:
+            print(f'{RED}[NOT READY] ' + '; '.join(problems) + RESET)
+        else:
+            print('[PRE-REQS PRESENT] Agent package, daemon package, INI, populated license and PHP-FPM detected.')
+            print('[VERIFY FIRST] Confirm the license matches the key saved through Cloudways UI; validate pool scope/authorization.')
+            if d['enabled']:
+                print('[ALREADY ENABLED] PHP-FPM module is enabled; verify live reporting.')
+            else:
+                print(f'{RED}[CAN ENABLE AFTER APPROVAL] php{v}-fpm New Relic extension is disabled.' + RESET)
+                print(f'Command: phpenmod -v {v} -s fpm newrelic')
+                print(f'Then: php-fpm{v} -t && systemctl restart php{v}-fpm  # approved maintenance only')
+
 show('7. VERSION-WISE MANUAL SETUP AND POST-CHECKS')
 print('No per-application or pool configuration changes are suggested here.')
 print('CAUTION: enabling New Relic for a PHP version affects every FPM pool using that version.')
@@ -234,5 +282,19 @@ for v in versions:
         f"pgrep -af '[n]ewrelic-daemon'\n"
         f"tail -n 20 /var/log/newrelic/newrelic-daemon.log\n"
         f"tail -n 20 /var/log/newrelic/php_agent.log")
-print('\nCheck the actual APM dashboard for connected app and transaction data.')
+show('8. WHEN TO USE WHICH ADVISOR / PHP APM CHECKLIST')
+print('INFRASTRUCTURE MONITORING: server CPU, RAM, disk, network and processes:')
+print('  curl -fsSL https://raw.githubusercontent.com/Muihammadusman2478/newrelic/refs/heads/main/infraagent | bash')
+print('PHP APM MONITORING: PHP transactions, slow requests, SQL and errors:')
+print('  curl -fsSL https://raw.githubusercontent.com/Muihammadusman2478/newrelic/refs/heads/main/phpapm | python3')
+print('PHP APM checklist for each PHP version actually used by applications:')
+print('  1. Verify the Cloudways UI key is in /etc/php/VERSION/mods-available/newrelic.ini for that version.')
+print('  2. Confirm license belongs to intended New Relic account; populated != validated.')
+print('  3. Check other pools using that version and get authorization for the change/restart.')
+print('  4. Enable FPM module, test php-fpmVERSION -t, then restart PHP-FPM with approval.')
+print('  5. Visit the intended site URL and generate normal UNCACHED PHP traffic.')
+print('  6. Check /var/log/newrelic/newrelic-daemon.log and php_agent.log for connection/errors.')
+print('  7. Check that application transactions appear on the APM dashboard.')
+print('WARNING: Full license keys for IN-USE PHP versions are shown; never share complete output publicly.')
+print('WARNING: Only execute remote scripts from trusted/reviewed GitHub sources.')
 print('No New Relic configuration changes were executed by this advisor.')
