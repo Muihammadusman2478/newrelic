@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Read-only New Relic PHP APM setup advisor for Debian/Cloudways."""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+APPCOUNT_URL = "https://raw.githubusercontent.com/Muihammadusman2478/myvar/refs/heads/main/appcount.sh"
+PHP_ROOT = Path('/etc/php')
+
+def command(args, timeout=15):
+    try:
+        return subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+def show(title):
+    print('\n' + '=' * 68 + '\n' + title + '\n' + '=' * 68)
+
+def status(label, value):
+    print(f'{label:<25} {value}')
+
+def suggestion(title, text):
+    print(f'\n# {title}\n{text}')
+
+def get_os():
+    vals = {}
+    p = Path('/etc/os-release')
+    if p.exists():
+        for line in p.read_text(errors='replace').splitlines():
+            if '=' in line and not line.startswith('#'):
+                k, v = line.split('=', 1)
+                vals[k] = v.strip().strip('"')
+    return vals
+
+def installed(pkg):
+    res = command(['dpkg-query','-W','-f=${Status} ${Version}',pkg])
+    if res and res.returncode == 0 and res.stdout.startswith('install ok installed'):
+        return res.stdout.strip().split()[-1]
+    return None
+
+def appcount():
+    """Download, syntax-check, and execute the user's existing appcount script."""
+    if not shutil.which('curl'):
+        return None, 'curl is missing'
+    with tempfile.TemporaryDirectory(prefix='nr-appcount-') as directory:
+        dest = str(Path(directory) / 'appcount.sh')
+        fetched = command(['curl','-fsSL','--connect-timeout','10','--max-time','60',APPCOUNT_URL,'-o',dest],timeout=70)
+        if not fetched or fetched.returncode != 0:
+            return None, 'appcount download failed'
+        synt = command(['bash','-n',dest])
+        if not synt or synt.returncode != 0:
+            return None, 'appcount Bash syntax check failed'
+        # appcount.sh is expected to define a function named appcount.
+        result = command(['bash','-c','source "$1"; if declare -F appcount >/dev/null; then appcount; else exit 45; fi','bash',dest],timeout=75)
+        if result and result.returncode == 0:
+            return result.stdout, None
+        return None, 'appcount execution failed / function not defined'
+
+def parse_apps(output):
+    apps = []
+    for line in output.splitlines():
+        # Typical appcount table: app_name | url | ssh | state | stack | PHP version
+        if '|' not in line or line.lstrip().startswith('-') or 'app_name' in line:
+            continue
+        cols = [x.strip() for x in line.split('|')]
+        if len(cols) < 6 or not re.fullmatch(r'[a-z]{8,16}',cols[0]):
+            continue
+        version = cols[-1]
+        if re.fullmatch(r'\d+\.\d+',version):
+            apps.append({'id':cols[0], 'url':cols[1], 'state':cols[3], 'stack':cols[4], 'php':version})
+    return apps
+
+def license_state(path):
+    if not path.is_file():
+        return 'FILE MISSING'
+    try:
+        values = re.findall(r'^\s*newrelic\.license\s*=\s*(.*?)\s*$',path.read_text(errors='replace'),re.M)
+        if not values:
+            return 'DIRECTIVE MISSING'
+        v = values[-1].split(';',1)[0].strip().strip('"\'')
+        if not v or v in ('YOUR_LICENSE_KEY','REPLACE_WITH_REAL_KEY'):
+            return 'EMPTY / PLACEHOLDER'
+        return 'POPULATED (not validated)'
+    except OSError:
+        return 'UNREADABLE'
+
+def get_pools(version):
+    directory = PHP_ROOT / version / 'fpm' / 'pool.d'
+    pools=[]
+    for p in sorted(directory.glob('*.conf')):
+        try:
+            txt=p.read_text(errors='replace')
+        except OSError:
+            continue
+        match=re.search(r'^\s*\[([^\]]+)\]',txt,re.M)
+        names=re.findall(r'^\s*php_(?:admin_)?value\[newrelic\.appname\]\s*=\s*(.*)$',txt,re.M)
+        enabled=re.findall(r'^\s*php_(?:admin_)?flag\[newrelic\.enabled\]\s*=\s*(\S+)',txt,re.M|re.I)
+        pools.append({'path':p,'pool':match.group(1) if match else '?', 'name':names[-1].strip() if names else None,'enabled':enabled[-1] if enabled else None})
+    return pools
+
+parser=argparse.ArgumentParser(description='Read-only PHP APM advisor for Cloudways servers')
+parser.add_argument('--app',help='Target app ID to monitor; only prints recommendations')
+parser.add_argument('--skip-appcount',action='store_true',help='Do not execute downloaded appcount function')
+args=parser.parse_args()
+
+show('NEW RELIC PHP APM ADVISOR — READ ONLY')
+osinfo=get_os()
+status('Hostname',os.uname().nodename)
+status('Operating system',osinfo.get('PRETTY_NAME','Unknown'))
+status('Architecture',os.uname().machine)
+status('Runs configuration changes','NO')
+
+show('1. CLOUDWAYS APPLICATIONS / MULTI-PHP')
+apps=[]
+if not args.skip_appcount:
+    print('Source of appcount function:',APPCOUNT_URL)
+    print('CAUTION: Running downloaded appcount.sh requires trusting its contents.')
+    raw,err=appcount()
+    if raw:
+        print(raw.strip())
+        apps=parse_apps(raw)
+    else:
+        print('Appcount unavailable:',err)
+else:
+    print('appcount skipped by request')
+if apps:
+    show('2. APPLICATION COUNTS BY PHP VERSION')
+    counts=Counter(a['php'] for a in apps)
+    for v in sorted(counts,key=lambda x:tuple(map(int,x.split('.')))):
+        print(f'PHP {v}: {counts[v]} application(s)')
+        for a in apps:
+            if a['php']==v:
+                print(f"  {a['id']} | {a['state']} | {a['stack']} | {a['url']}")
+else:
+    print('WARNING: Could not reliably parse application-to-PHP mapping.')
+    print('Confirm target PHP version manually before using any suggested changes.')
+
+show('3. NEW RELIC AGENT PACKAGES')
+for pkg in ['newrelic-php5','newrelic-php5-common','newrelic-daemon','newrelic-sysmond']:
+    status(pkg,installed(pkg) or 'NOT INSTALLED')
+
+show('4. PHP VERSION-WISE CONFIG AND FPM STATUS')
+versions=sorted((p.name for p in PHP_ROOT.glob('*') if p.is_dir() and re.fullmatch(r'\d+\.\d+',p.name)),key=lambda x:tuple(map(int,x.split('.'))))
+for v in versions:
+    base=PHP_ROOT/v
+    ini=base/'mods-available'/'newrelic.ini'
+    enabled_files=list((base/'fpm'/'conf.d').glob('*newrelic*.ini'))
+    svc=command(['systemctl','is-active',f'php{v}-fpm'])
+    print(f'\n--- PHP {v} ---')
+    status('INI path',str(ini))
+    status('INI exists',str(ini.exists()))
+    status('License',license_state(ini))
+    status('FPM extension',', '.join(str(p) for p in enabled_files) or 'NOT ENABLED')
+    status('FPM service',svc.stdout.strip() if svc and svc.stdout.strip() else 'unknown')
+    for p in get_pools(v):
+        print('  Pool:',p['path'])
+        print('    Pool name:',p['pool'],'| New Relic name:',p['name'] or '(default)','| newrelic.enabled:',p['enabled'] or '(inherited)')
+
+show('5. DAEMON / LOGS')
+proc=command(['pgrep','-af','[/]usr/bin/newrelic-daemon'])
+print(proc.stdout.strip() if proc and proc.returncode==0 else 'New Relic PHP daemon not running (may start on PHP activity)')
+for name in ['newrelic-daemon.log','php_agent.log']:
+    p=Path('/var/log/newrelic')/name
+    print(f'\nLog path: {p} | {"FOUND" if p.is_file() else "MISSING"}')
+    if p.is_file():
+        try:
+            lines=p.read_text(errors='replace').splitlines()[-20:]
+            # Avoid leaking potential credentials or tokens; still review before sharing.
+            for line in lines:
+                line=re.sub(r'(?i)(license(?:_key)?\s*[:=]\s*)\S+',r'\1[REDACTED]',line)
+                line=re.sub(r'(?i)(run id\s+[\'\"])[^\'\"]+',r'\1[REDACTED]',line)
+                print(line)
+        except OSError:
+            print('Cannot read log')
+
+show('6. RECOMMENDED MANUAL STEPS')
+print('The commands below are ADVICE ONLY. Review server scope, permissions and get approval.')
+if osinfo.get('ID')!='debian' or osinfo.get('VERSION_ID') not in ('11','12','13'):
+    print('Unsupported/unverified Debian release for this advisor. Verify official instructions before installing.')
+elif not installed('newrelic-php5'):
+    suggestion('Agent package missing — inspect existing APT sources and candidates first',
+       "grep -RHn 'newrelic' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null\napt-cache policy newrelic-php5\napt-get -s install newrelic-php5")
+    suggestion('After checking official New Relic repository and package dependencies',
+       'apt-get update\napt-get install newrelic-php5\n# If nonstandard PHP is not configured, review: newrelic-install install')
+else:
+    print('[OK] PHP agent package already installed; do not reinstall unnecessarily.')
+
+chosen=next((a for a in apps if a['id']==args.app),None) if args.app else None
+if args.app and not chosen:
+    print(f'WARNING: --app {args.app} was not found in appcount output. No app-specific change commands generated.')
+elif not args.app:
+    print('\nTo generate version-specific steps for one app, rerun with:')
+    print('  python3 newrelic_php_apm_advisor.py --app APP_ID')
+else:
+    v=chosen['php']
+    ini=PHP_ROOT/v/'mods-available'/'newrelic.ini'
+    pools=get_pools(v)
+    matching=[p for p in pools if args.app in p['path'].name or args.app in p['pool']]
+    others=[p for p in pools if p not in matching and not p['path'].name.startswith(('placeholder','cloudways.conf'))]
+    print(f'\nTarget application: {args.app} | PHP {v} | {chosen["url"]}')
+    suggestion('Review license and confirm it matches the intended New Relic account (do not post secret)',
+       f"grep -nE '^[[:space:]]*newrelic\\.license[[:space:]]*=' {ini} | sed -E 's/(newrelic\\.license[[:space:]]*=).*/\\1 [REDACTED]/'")
+    if not ini.is_file():
+        print('STOP: Target PHP New Relic INI missing; confirm package configuration before enabling.')
+    elif license_state(ini) != 'POPULATED (not validated)':
+        suggestion('Edit existing New Relic INI to set a valid license (do not paste it in chat)',
+            f'vim {ini}\n# Inside file: newrelic.license = "YOUR_LICENSE_KEY"')
+    else:
+        print('[OK] License directive populated; verify it belongs to intended New Relic account.')
+    if ini.is_file() and not list((PHP_ROOT/v/'fpm'/'conf.d').glob('*newrelic*.ini')):
+        suggestion(f'Enable the PHP {v} FPM extension AFTER pool isolation is prepared',f'phpenmod -v {v} -s fpm newrelic')
+    elif ini.is_file():
+        print(f'[OK] New Relic INI link is present for PHP {v} FPM.')
+    for p in matching:
+        print('TARGET POOL:',p['path'])
+        print('  Ensure unique php_value[newrelic.appname] and php_flag[newrelic.enabled] = on.')
+    for p in others:
+        print('OTHER SAME-VERSION POOL:',p['path'])
+        print('  If authorized and not monitored, set: php_flag[newrelic.enabled] = off')
+    print('WARNING: Do not edit other app pools without permission. Cloudways may regenerate managed pool files.')
+    suggestion('After approved pool changes and module enabling, validate and restart FPM',
+       f'php-fpm{v} -t\n# Only with approval (affects all PHP {v} pools):\nsystemctl restart php{v}-fpm')
+    suggestion('Verify daemon, status and APM reporting',
+       f"systemctl is-active php{v}-fpm\npgrep -af '[n]ewrelic-daemon'\ntail -n 20 /var/log/newrelic/newrelic-daemon.log")
+print('\nNo New Relic configuration changes were executed by this advisor.')
