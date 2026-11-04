@@ -11,6 +11,9 @@ from pathlib import Path
 
 APPCOUNT_URL = "https://raw.githubusercontent.com/Muihammadusman2478/myvar/refs/heads/main/appcount.sh"
 PHP_ROOT = Path('/etc/php')
+RED = '\033[1;31m'
+RESET = '\033[0m'
+
 
 def command(args, timeout=15):
     try:
@@ -149,7 +152,14 @@ for v in versions:
     status('INI path',str(ini))
     status('INI exists',str(ini.is_file()))
     status('License',license_state(ini))
-    status('FPM extension','ENABLED' if enabled else 'NOT ENABLED / NOT CONFIRMED')
+    if enabled:
+        status('FPM extension', 'ENABLED')
+    else:
+        status('FPM extension', f'{RED}NOT ENABLED / NOT CONFIRMED{RESET}')
+        if state[v]['service'] == 'active':
+            print(f'{RED}[ACTION REQUIRED] After enabling the extension, validate and restart php{v}-fpm to load it (approval required).{RESET}')
+        else:
+            print(f'{RED}[ACTION REQUIRED] If this PHP version is needed, enable its extension; restart/start the relevant FPM service only when approved.{RESET}')
     for link in links:
         status('FPM config path',str(link))
         status('Symlink target',str(link.resolve()))
@@ -203,13 +213,15 @@ for v in versions:
         print('[STOP] New Relic INI missing for this PHP version. Verify package/config setup first.')
         continue
     if license_state(ini) != 'POPULATED (not validated)':
-        print('[STOP] License is missing or placeholder. Edit the existing INI with a valid key first, BETTER add from the UI under monitoring section.')
+        print('[STOP] License is missing or placeholder. Edit the existing INI with a valid key first.')
         suggestion('Open license config for manual editing (avoid displaying keys in chat)', f'vim {ini}')
     else:
         print('[OK] License directive populated; verify it matches the intended New Relic account.')
     if not data['enabled']:
+        print(f'{RED}[WARNING] New Relic FPM extension is NOT ENABLED for PHP {v}.{RESET}')
         suggestion('Enable New Relic extension ONLY after checking scope and license',
             f'phpenmod -v {v} -s fpm newrelic')
+        print(f'{RED}[IMPORTANT] Enabling the module does NOT load it into existing FPM workers. Validate then restart php{v}-fpm with approval.{RESET}')
     else:
         print('[OK] Extension is already enabled; do not enable again.')
     suggestion('Post-check: confirm module, validate PHP-FPM, and restart ONLY if approved',
