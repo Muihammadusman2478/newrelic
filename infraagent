@@ -1,0 +1,469 @@
+
+python3 - <<'PY'
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+CONFIG = Path("/etc/newrelic-infra.yml")
+REPO = Path("/etc/apt/sources.list.d/newrelic-infra.list")
+KEY = Path("/usr/share/keyrings/newrelic-infra-archive-keyring.gpg")
+
+SUPPORTED = {
+    "11": "bullseye",
+    "12": "bookworm",
+    "13": "trixie",
+}
+
+def run(*args):
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+def heading(title):
+    print("\n" + "=" * 65)
+    print(title)
+    print("=" * 65)
+
+def result(name, value):
+    print(f"{name:<27}: {value}")
+
+def command(number, title, cmd):
+    print(f"\nSTEP {number}: {title}")
+    print("-" * 55)
+    print(cmd)
+
+def redact(line):
+    line = re.sub(
+        r"(?i)(license[_ .-]*key\s*[:=]\s*)\S+",
+        r"\1[REDACTED]",
+        line
+    )
+    return line
+
+# ====================================================
+# 1. OPERATING SYSTEM
+# ====================================================
+
+osinfo = {}
+os_file = Path("/etc/os-release")
+
+if os_file.exists():
+    for line in os_file.read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            osinfo[k] = v.strip().strip('"')
+
+os_id = osinfo.get("ID", "unknown")
+version = osinfo.get("VERSION_ID", "unknown")
+codename = osinfo.get("VERSION_CODENAME", "unknown")
+expected = SUPPORTED.get(version)
+
+supported = (
+    os_id == "debian"
+    and expected == codename
+)
+
+hostname_result = run("hostname")
+hostname = (
+    hostname_result.stdout.strip()
+    if hostname_result and hostname_result.returncode == 0
+    else "Unknown"
+)
+
+heading("NEW RELIC INFRASTRUCTURE SETUP ADVISOR V2")
+
+result("Hostname", hostname)
+result("Operating System", osinfo.get("PRETTY_NAME", "Unknown"))
+result("OS Version", version)
+result("OS Codename", codename)
+result("Architecture", os.uname().machine)
+result("Supported by Advisor", "YES" if supported else "NO")
+
+# ====================================================
+# 2. PACKAGE INSTALLATION
+# ====================================================
+
+heading("1. NEW RELIC INFRASTRUCTURE PACKAGE")
+
+pkg = run(
+    "dpkg-query",
+    "-W",
+    "-f=${Status} ${Version}",
+    "newrelic-infra"
+)
+
+installed = bool(
+    pkg
+    and pkg.returncode == 0
+    and pkg.stdout.startswith("install ok installed")
+)
+
+result(
+    "Infrastructure Agent",
+    "INSTALLED" if installed else "NOT INSTALLED"
+)
+
+if installed:
+    result("Package Version", pkg.stdout.strip().split()[-1])
+
+# ====================================================
+# 3. REPOSITORY
+# ====================================================
+
+heading("2. NEW RELIC REPOSITORY")
+
+source_paths = [Path("/etc/apt/sources.list")]
+
+source_dir = Path("/etc/apt/sources.list.d")
+
+if source_dir.is_dir():
+    source_paths.extend(source_dir.glob("*.list"))
+    source_paths.extend(source_dir.glob("*.sources"))
+
+repo_files = []
+
+for file in source_paths:
+    try:
+        if file.is_file():
+            content = file.read_text()
+
+            if (
+                "download.newrelic.com/infrastructure_agent"
+                in content
+            ):
+                repo_files.append(str(file))
+    except (OSError, UnicodeError):
+        pass
+
+repo_present = bool(repo_files)
+
+result(
+    "Repository",
+    "CONFIGURED" if repo_present else "NOT CONFIGURED"
+)
+
+for file in repo_files:
+    print("Repository Path:", file)
+
+result(
+    "Signing Key",
+    str(KEY) if KEY.exists() else "NOT FOUND"
+)
+
+legacy_key = Path(
+    "/etc/apt/trusted.gpg.d/newrelic-infra.gpg"
+)
+
+result(
+    "Legacy Signing Key",
+    str(legacy_key) if legacy_key.exists() else "NOT FOUND"
+)
+
+# ====================================================
+# 4. YAML CONFIGURATION
+# ====================================================
+
+heading("3. YAML CONFIGURATION")
+
+config_exists = CONFIG.is_file()
+
+result("Configuration Path", str(CONFIG))
+result(
+    "YAML File",
+    "FOUND" if config_exists else "MISSING"
+)
+
+license_found = False
+
+if config_exists:
+    try:
+        content = CONFIG.read_text()
+
+        license_match = re.search(
+            r"^\s*license_key\s*:\s*(.*?)\s*(?:#.*)?$",
+            content,
+            re.MULTILINE
+        )
+
+        if license_match:
+            value = license_match.group(1).strip().strip("'\"")
+
+            license_found = bool(value) and value not in (
+                "YOUR_LICENSE_KEY",
+                "REPLACE_WITH_REAL_KEY"
+            )
+
+        for setting in (
+            "display_name",
+            "override_hostname",
+            "enable_process_metrics",
+            "status_server_enabled",
+            "status_server_port"
+        ):
+            match = re.search(
+                rf"^\s*{setting}\s*:\s*(.+)$",
+                content,
+                re.MULTILINE
+            )
+
+            if match:
+                result(setting, match.group(1).strip())
+
+    except (OSError, UnicodeError):
+        print("[WARNING] Unable to read configuration file")
+
+result(
+    "License Key",
+    "POPULATED (NOT VALIDATED)"
+    if license_found
+    else "MISSING / EMPTY / PLACEHOLDER"
+)
+
+# ====================================================
+# 5. SERVICE STATUS
+# ====================================================
+
+heading("4. INFRASTRUCTURE SERVICE")
+
+active = run(
+    "systemctl",
+    "is-active",
+    "newrelic-infra"
+)
+
+enabled = run(
+    "systemctl",
+    "is-enabled",
+    "newrelic-infra"
+)
+
+service_active = bool(
+    active
+    and active.stdout.strip() == "active"
+)
+
+result(
+    "Service Status",
+    "ACTIVE" if service_active else "NOT ACTIVE"
+)
+
+result(
+    "Startup Status",
+    enabled.stdout.strip() if enabled else "UNKNOWN"
+)
+
+# ====================================================
+# 6. PROCESSES
+# ====================================================
+
+heading("5. RUNNING PROCESSES")
+
+processes = run(
+    "pgrep",
+    "-af",
+    "[n]ewrelic-infra"
+)
+
+if processes and processes.returncode == 0:
+    print(processes.stdout.strip())
+else:
+    print("No New Relic Infrastructure process detected")
+
+# ====================================================
+# 7. LOG FILES
+# ====================================================
+
+heading("6. LOG FILE LOCATIONS")
+
+log_paths = [
+    "/var/log/newrelic-infra",
+    "/var/log/newrelic-infra/newrelic-infra.log",
+]
+
+for path in log_paths:
+    result(
+        path,
+        "EXISTS" if Path(path).exists() else "MISSING"
+    )
+
+print("\nRecent Service Logs (Last 20 Lines):")
+
+logs = run(
+    "journalctl",
+    "-u",
+    "newrelic-infra",
+    "-n",
+    "20",
+    "--no-pager",
+    "-o",
+    "cat"
+)
+
+if logs and logs.stdout.strip():
+    for line in logs.stdout.splitlines():
+        print(redact(line))
+else:
+    print("No journal entries found")
+
+# ====================================================
+# 8. MANUAL COMMAND RECOMMENDATIONS
+# ====================================================
+
+heading("7. RECOMMENDED MANUAL INSTALLATION COMMANDS")
+
+if not supported:
+    print("Unsupported OS for this advisor.")
+    print("No installation commands generated.")
+    raise SystemExit(0)
+
+step = 1
+
+# Prerequisites
+missing = [
+    tool for tool in ("curl", "gpg")
+    if not shutil.which(tool)
+]
+
+if missing and not installed:
+    command(
+        step,
+        "Install Missing Prerequisites",
+        "apt-get update && apt-get install " + " ".join(missing)
+    )
+    step += 1
+
+# Repository setup
+if not repo_present and not installed:
+
+    command(
+        step,
+        "Install New Relic Repository Signing Key",
+        "curl -fsSL "
+        "https://download.newrelic.com/"
+        "infrastructure_agent/gpg/newrelic-infra.gpg "
+        "| gpg --dearmor -o "
+        "/usr/share/keyrings/"
+        "newrelic-infra-archive-keyring.gpg"
+    )
+    step += 1
+
+    command(
+        step,
+        f"Configure Debian {version} Repository",
+        f'echo "deb [signed-by={KEY}] '
+        "https://download.newrelic.com/"
+        "infrastructure_agent/linux/apt "
+        f'{codename} main" > {REPO}'
+    )
+    step += 1
+
+elif repo_present:
+    print("\n[OK] Existing New Relic repository detected.")
+    print("Review repository configuration:")
+
+    for file in repo_files:
+        print("cat", file)
+
+# YAML creation / license
+if not config_exists:
+
+    command(
+        step,
+        "Create YAML Configuration and Add License",
+        'echo "license_key: YOUR_LICENSE_KEY" '
+        '| sudo tee -a /etc/newrelic-infra.yml'
+    )
+    step += 1
+
+elif not license_found:
+
+    command(
+        step,
+        "Add Missing License Key",
+        'echo "license_key: YOUR_LICENSE_KEY" '
+        '| sudo tee -a /etc/newrelic-infra.yml'
+    )
+    step += 1
+
+else:
+    print("\n[OK] License key already populated.")
+    print("No additional license directive required.")
+
+# Install package
+if not installed:
+
+    command(
+        step,
+        "Refresh Package Information",
+        "apt-get update"
+    )
+	
+    step += 1
+
+    command(
+        step,
+        "Install New Relic Infrastructure Agent",
+        "apt-get install newrelic-infra"
+    )
+    step += 1
+
+else:
+    print("\n[OK] Infrastructure Agent already installed.")
+
+# Restart only if needed
+if not service_active:
+
+    command(
+        step,
+        "Start Infrastructure Agent",
+        "systemctl restart newrelic-infra"
+    )
+    step += 1
+
+else:
+    print("\n[OK] Infrastructure Agent is currently running.")
+    print("Restart only if its configuration was modified.")
+
+# Verification commands
+command(
+    step,
+    "Verify Service Status",
+    "systemctl is-active newrelic-infra"
+)
+step += 1
+
+command(
+    step,
+    "Verify Infrastructure Agent Processes",
+    "pgrep -af '[n]ewrelic-infra'"
+)
+step += 1
+
+command(
+    step,
+    "View Last 20 Service Log Entries",
+    "journalctl -u newrelic-infra -n 20 --no-pager"
+)
+
+heading("FINAL DIAGNOSTIC SUMMARY")
+
+result("Operating System", osinfo.get("PRETTY_NAME", "Unknown"))
+result("Infrastructure Package", "INSTALLED" if installed else "MISSING")
+result("APT Repository", "FOUND" if repo_present else "MISSING")
+result("YAML Configuration", "FOUND" if config_exists else "MISSING")
+result("License Key", "POPULATED" if license_found else "MISSING")
+result("Infrastructure Service", "ACTIVE" if service_active else "INACTIVE")
+
+print("\nNo configuration changes were made.")
+print("Run the recommended commands manually.")
+print("Verify metrics under New Relic > Infrastructure > Hosts.")
+
+PY
